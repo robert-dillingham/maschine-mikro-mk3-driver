@@ -1,12 +1,10 @@
 use serde::Deserialize;
 
 #[derive(Deserialize, Debug)]
+#[serde(default)]
 pub(crate) struct Settings {
-    #[serde(default)]
     pub notemaps: Vec<u8>,
-    #[serde(default)]
     pub client_name: String,
-    #[serde(default)]
     pub port_name: String,
 }
 
