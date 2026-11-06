@@ -9,6 +9,7 @@ use hidapi::{HidDevice, HidResult};
 use maschine_library::controls::{Buttons, PadEventType};
 use maschine_library::lights::{Brightness, Lights, PadColors};
 use maschine_library::screen::Screen;
+use maschine_library::font::Font;
 use midir::os::unix::VirtualOutput;
 use midir::{MidiOutput, MidiOutputConnection};
 use midly::{MidiMessage, live::LiveEvent};
@@ -63,14 +64,34 @@ fn main() -> HidResult<()> {
     Ok(())
 }
 
+fn show_text(device: &HidDevice, screen: &mut Screen, text: &str) -> HidResult<()> {
+    // pad to 13 characters (the most that fit across the screen) so shorter
+    // text fully overwrites whatever was there before
+    for (i, ch) in format!("{:<13}", text).chars().enumerate() {
+        Font::write_char(screen, 12, 10 + i * 9, ch, 1);
+    }
+    screen.write(device)
+}
+
+const MODE_BUTTONS: [Buttons; 1] = [Buttons::Volume]; // add more buttons here later
+const ENCODER_RANGE: i32 = 16; // placeholder, see "Before you test"
+
 fn main_loop(
+
     device: &HidDevice,
-    _screen: &mut Screen,
+    screen: &mut Screen,
     lights: &mut Lights,
     port: &mut MidiOutputConnection,
     settings: &Settings,
+
 ) -> HidResult<()> {
+
     let mut buf = [0u8; 64];
+    let mut was_down = [false; 48]; // previous state of each button
+    let mut active_mode: Option<Buttons> = None;
+    let mut volume: u8 = 100;
+    let mut prev_encoder: Option<u8> = None;
+    show_text(device, screen, "Ready...")?;   // display "Ready..." on the screen
     loop {
         let size = device.read_timeout(&mut buf, 10)?;
         if size < 1 {
@@ -95,6 +116,35 @@ fn main_loop(
                     if status {
                         println!("{:?}", button);
                     }
+
+                    // new: mode buttons act like radio buttons
+                    if MODE_BUTTONS.contains(&button) {
+                        if status && !was_down[idx] {
+                            // pressing the active mode turns it off; otherwise select it
+                            active_mode = if active_mode == Some(button) {
+                                None
+                            } else {
+                                Some(button)
+                            };
+                            for b in MODE_BUTTONS {
+                                let on = active_mode == Some(b);
+                                lights.set_button(
+                                    b,
+                                    if on { Brightness::Normal } else { Brightness::Off },
+                                );
+                            }
+                            // display the current volume on the screen if the volume button is active
+                            if active_mode == Some(Buttons::Volume) {
+                                show_text(device, screen, &format!("Volume: {}", volume))?;
+                            } else {
+                                show_text(device, screen, "Ready...")?;
+                            }
+                            changed_lights = true;
+                        }
+                        was_down[idx] = status;
+                        continue;
+                    }
+
                     if lights.button_has_light(button) {
                         let light_status = lights.get_button(button) != Brightness::Off;
                         if status != light_status {
@@ -113,6 +163,35 @@ fn main_loop(
             }
             let encoder_val = buf[7];
             println!("Encoder: {}", encoder_val);
+            if let Some(prev) = prev_encoder {
+                let mut delta = encoder_val as i32 - prev as i32;
+                // the position wraps around, so take the shorter way round
+                if delta > ENCODER_RANGE / 2 {
+                    delta -= ENCODER_RANGE;
+                } else if delta < -ENCODER_RANGE / 2 {
+                    delta += ENCODER_RANGE;
+                }
+                if delta != 0 && active_mode == Some(Buttons::Volume) {
+                    // adjust volume, multiply change by 2 to make it more responsive
+                    volume = (volume as i32 + delta * 2).clamp(0, 127) as u8;
+                    // print volume to screen
+                    println!("Volume: {}", volume);
+                    println!("Volume: {}", volume);
+                    show_text(device, screen, &format!("Volume: {}", volume))?;
+                    // send volume change as MIDI CC7
+                    let ev = LiveEvent::Midi {
+                        channel: 0.into(),
+                        message: MidiMessage::Controller {
+                            controller: 7.into(),
+                            value: volume.into(),
+                        },
+                    };
+                    let mut out = Vec::new();
+                    ev.write(&mut out).unwrap();
+                    port.send(&out[..]).unwrap();
+                }
+            }
+            prev_encoder = Some(encoder_val);
             let slider_val = buf[10];
             if slider_val != 0 {
                 println!("Slider: {}", slider_val);

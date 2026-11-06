@@ -693,7 +693,7 @@ const LOWERCASE: [[&[u8; 8]; 8]; 26] = [
 
 const SPACE: [&[u8; 8]; 8] = [b"        "; 8];
 
-const PUNCTUATION: [[&[u8; 8]; 8]; 14] = [
+const PUNCTUATION: [[&[u8; 8]; 8]; 15] = [
     // (
     [
         b"    x   ",
@@ -848,6 +848,17 @@ const PUNCTUATION: [[&[u8; 8]; 8]; 14] = [
         b"        ",
         b"        ",
     ],
+    // :
+    [
+        b"        ",
+        b"   xx   ",
+        b"   xx   ",
+        b"        ",
+        b"        ",
+        b"   xx   ",
+        b"   xx   ",
+        b"        ",
+    ],
 ];
 
 pub struct Font {}
@@ -877,6 +888,7 @@ impl Font {
             '*' => &PUNCTUATION[11],
             '=' => &PUNCTUATION[12],
             '-' => &PUNCTUATION[13],
+            ':' => &PUNCTUATION[14],
             _ => return false,
         };
 
@@ -903,7 +915,7 @@ mod tests {
     fn writes_all_supported_characters() {
         let mut screen = Screen::new();
         for character in
-            "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz (),.!?/><|&*=-".chars()
+            "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz (),.!?/><|&*=-:".chars()
         {
             assert!(Font::write_char(&mut screen, 0, 0, character, 1));
         }

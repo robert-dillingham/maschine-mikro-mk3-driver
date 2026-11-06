@@ -9,7 +9,7 @@ pub(crate) fn self_test(
     screen: &mut Screen,
     lights: &mut Lights,
 ) -> HidResult<()> {
-    for (index, character) in "8========D".chars().enumerate() {
+    for (index, character) in "Hi Kate!".chars().enumerate() {
         Font::write_char(screen, 12, 10 + index * 9, character, 1);
         screen.write(device)?;
         if index < 5 {
