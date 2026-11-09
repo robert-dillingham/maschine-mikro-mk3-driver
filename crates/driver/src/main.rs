@@ -73,8 +73,50 @@ fn show_text(device: &HidDevice, screen: &mut Screen, text: &str) -> HidResult<(
     screen.write(device)
 }
 
-const MODE_BUTTONS: [Buttons; 1] = [Buttons::Volume]; // add more buttons here later
-const ENCODER_RANGE: i32 = 16; // placeholder, see "Before you test"
+// One row per mode button. Like a Python list of dicts:
+// [{"button": Volume, "name": "Volume", "cc": 7, "start": 100}, ...]
+struct Mode {
+    button: Buttons,
+    name: &'static str, // text shown on the screen
+    cc: u8,             // MIDI CC number (for multi-parameter modes: the first CC)
+    start: u8,          // starting value
+    step: i32,          // value change per encoder click
+    params: usize,      // how many parameters this mode controls (1 = plain mode)
+}
+
+const MAX_PARAMS: usize = 8; // the most parameters any mode can have
+
+const MODES: [Mode; 4] = [
+    Mode { button: Buttons::Volume, name: "Volume", cc: 7, start: 100, step: 2, params: 1 },
+    Mode { button: Buttons::Swing, name: "Swing", cc: 22, start: 0, step: 1, params: 1 },
+    Mode { button: Buttons::Tempo, name: "Tempo", cc: 23, start: 64, step: 1, params: 1 },
+    Mode { button: Buttons::Plugin, name: "Param", cc: 102, start: 64, step: 1, params: 8 },
+];
+
+// screen text: "Volume: 100" for plain modes, "Param 3: 64" for multi-parameter ones
+fn mode_text(mode: &Mode, param: usize, value: u8) -> String {
+    if mode.params > 1 {
+        format!("{} {}: {}", mode.name, param + 1, value)
+    } else {
+        format!("{}: {}", mode.name, value)
+    }
+}
+const ENCODER_RANGE: i32 = 16; // the encoder runs 0-15
+
+const NAV_BUTTONS: [(Buttons, u8); 2] = [(Buttons::Left, 20), (Buttons::Right, 21)];
+
+fn send_cc(port: &mut MidiOutputConnection, controller: u8, value: u8) {
+    let ev = LiveEvent::Midi {
+        channel: 0.into(),
+        message: MidiMessage::Controller {
+            controller: controller.into(),
+            value: value.into(),
+        },
+    };
+    let mut out = Vec::new();
+    ev.write(&mut out).unwrap();
+    port.send(&out[..]).unwrap();
+}
 
 fn main_loop(
 
@@ -88,8 +130,10 @@ fn main_loop(
 
     let mut buf = [0u8; 64];
     let mut was_down = [false; 48]; // previous state of each button
-    let mut active_mode: Option<Buttons> = None;
-    let mut volume: u8 = 100;
+    let mut active_mode: Option<usize> = None; // position in MODES, or None
+    // one row of values per mode (plain modes only use the first slot)
+    let mut mode_values: [[u8; MAX_PARAMS]; MODES.len()] = MODES.map(|m| [m.start; MAX_PARAMS]);
+    let mut current_param: usize = 0; // which parameter Left/Right have selected
     let mut prev_encoder: Option<u8> = None;
     show_text(device, screen, "Ready...")?;   // display "Ready..." on the screen
     loop {
@@ -117,27 +161,35 @@ fn main_loop(
                         println!("{:?}", button);
                     }
 
-                    // new: mode buttons act like radio buttons
-                    if MODE_BUTTONS.contains(&button) {
+                    if let Some(m_idx) = MODES.iter().position(|m| m.button == button) {
                         if status && !was_down[idx] {
                             // pressing the active mode turns it off; otherwise select it
-                            active_mode = if active_mode == Some(button) {
+                            active_mode = if active_mode == Some(m_idx) {
                                 None
                             } else {
-                                Some(button)
+                                Some(m_idx)
                             };
-                            for b in MODE_BUTTONS {
-                                let on = active_mode == Some(b);
+                            // only the active mode's light stays on
+                            for (i, m) in MODES.iter().enumerate() {
                                 lights.set_button(
-                                    b,
-                                    if on { Brightness::Normal } else { Brightness::Off },
+                                    m.button,
+                                    if active_mode == Some(i) {
+                                        Brightness::Normal
+                                    } else {
+                                        Brightness::Off
+                                    },
                                 );
                             }
-                            // display the current volume on the screen if the volume button is active
-                            if active_mode == Some(Buttons::Volume) {
-                                show_text(device, screen, &format!("Volume: {}", volume))?;
-                            } else {
-                                show_text(device, screen, "Ready...")?;
+                            match active_mode {
+                                Some(i) => {
+                                    let p = current_param % MODES[i].params;
+                                    show_text(
+                                        device,
+                                        screen,
+                                        &mode_text(&MODES[i], p, mode_values[i][p]),
+                                    )?
+                                }
+                                None => show_text(device, screen, "Ready...")?,
                             }
                             changed_lights = true;
                         }
@@ -145,6 +197,46 @@ fn main_loop(
                         continue;
                     }
 
+                    // in a multi-parameter mode, Left/Right pick the parameter
+                    // instead of sending their normal CC
+                    let paging = match active_mode {
+                        Some(i) => {
+                            MODES[i].params > 1
+                                && (button == Buttons::Left || button == Buttons::Right)
+                        }
+                        None => false,
+                    };
+                    if paging {
+                        if status && !was_down[idx] {
+                            if let Some(i) = active_mode {
+                                let n = MODES[i].params;
+                                current_param = if button == Buttons::Right {
+                                    (current_param + 1) % n
+                                } else {
+                                    (current_param + n - 1) % n
+                                };
+                                let p = current_param % n;
+                                show_text(
+                                    device,
+                                    screen,
+                                    &mode_text(&MODES[i], p, mode_values[i][p]),
+                                )?;
+                            }
+                        }
+                        was_down[idx] = status;
+                    }
+
+                    // navigation buttons: send a CC on press (127) and release (0)
+                    for (nav_button, cc) in NAV_BUTTONS {
+                        if !paging && button == nav_button {
+                            if status != was_down[idx] {
+                                send_cc(port, cc, if status { 127 } else { 0 });
+                            }
+                            was_down[idx] = status;
+                        }
+                    }
+
+                    // other buttons: if they have lights, turn them on/off based on the button state
                     if lights.button_has_light(button) {
                         let light_status = lights.get_button(button) != Brightness::Off;
                         if status != light_status {
@@ -171,24 +263,18 @@ fn main_loop(
                 } else if delta < -ENCODER_RANGE / 2 {
                     delta += ENCODER_RANGE;
                 }
-                if delta != 0 && active_mode == Some(Buttons::Volume) {
-                    // adjust volume, multiply change by 2 to make it more responsive
-                    volume = (volume as i32 + delta * 2).clamp(0, 127) as u8;
-                    // print volume to screen
-                    println!("Volume: {}", volume);
-                    println!("Volume: {}", volume);
-                    show_text(device, screen, &format!("Volume: {}", volume))?;
-                    // send volume change as MIDI CC7
-                    let ev = LiveEvent::Midi {
-                        channel: 0.into(),
-                        message: MidiMessage::Controller {
-                            controller: 7.into(),
-                            value: volume.into(),
-                        },
-                    };
-                    let mut out = Vec::new();
-                    ev.write(&mut out).unwrap();
-                    port.send(&out[..]).unwrap();
+                if delta != 0 {
+                    if let Some(i) = active_mode {
+                        let p = current_param % MODES[i].params;
+                        // each mode sets its own step size
+                        let value =
+                            (mode_values[i][p] as i32 + delta * MODES[i].step).clamp(0, 127) as u8;
+                        mode_values[i][p] = value;
+                        let text = mode_text(&MODES[i], p, value);
+                        println!("{}", text);
+                        show_text(device, screen, &text)?;
+                        send_cc(port, MODES[i].cc + p as u8, value);
+                    }
                 }
             }
             prev_encoder = Some(encoder_val);
