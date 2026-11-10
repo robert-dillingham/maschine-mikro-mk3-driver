@@ -12,7 +12,7 @@ use maschine_library::screen::Screen;
 use maschine_library::font::Font;
 use midir::os::unix::VirtualOutput;
 use midir::{MidiOutput, MidiOutputConnection};
-use midly::{MidiMessage, live::LiveEvent};
+use midly::{MidiMessage, PitchBend, live::LiveEvent};
 
 #[derive(Parser, Debug)]
 #[clap(
@@ -104,6 +104,11 @@ fn mode_text(mode: &Mode, param: usize, value: u8) -> String {
 const ENCODER_RANGE: i32 = 16; // the encoder runs 0-15
 
 const NAV_BUTTONS: [(Buttons, u8); 2] = [(Buttons::Left, 20), (Buttons::Right, 21)];
+const RECORD_CC: u8 = 24; // Sampling button: record toggle
+// transport buttons
+const PLAY_CC: u8 = 25;
+const STOP_CC: u8 = 26;
+const REC_CC: u8 = 27;
 
 fn send_cc(port: &mut MidiOutputConnection, controller: u8, value: u8) {
     let ev = LiveEvent::Midi {
@@ -116,6 +121,53 @@ fn send_cc(port: &mut MidiOutputConnection, controller: u8, value: u8) {
     let mut out = Vec::new();
     ev.write(&mut out).unwrap();
     port.send(&out[..]).unwrap();
+}
+
+const STRIP_BUTTONS: [Buttons; 3] = [Buttons::Pitch, Buttons::Mod, Buttons::Perform];
+const MOD_CC: u8 = 1; // the standard mod wheel CC
+const PERFORM_CC: u8 = 29; // Perform strip: momentary, snaps to 0 on release
+
+// bend runs from -8192 to 8191, with 0 = centered
+fn send_pitch(port: &mut MidiOutputConnection, bend: i16) {
+    let ev = LiveEvent::Midi {
+        channel: 0.into(),
+        message: MidiMessage::PitchBend {
+            bend: PitchBend::from_int(bend),
+        },
+    };
+    let mut out = Vec::new();
+    ev.write(&mut out).unwrap();
+    port.send(&out[..]).unwrap();
+}
+
+// draw the 25 strip LEDs. pos is 0 to 24 (12 is the middle).
+// Pitch: lit dots from the center out to pos. Mod: a bar from the left up to pos.
+fn draw_strip(lights: &mut Lights, mode: Option<Buttons>, pos: usize) {
+    for i in 0..25usize {
+        let b = match mode {
+            Some(Buttons::Pitch) => {
+                let (lo, hi) = (pos.min(12), pos.max(12));
+                if i == pos || i == 12 {
+                    Brightness::Normal
+                } else if i > lo && i < hi {
+                    Brightness::Dim
+                } else {
+                    Brightness::Off
+                }
+            }
+            Some(_) => {
+                if i == pos {
+                    Brightness::Normal
+                } else if i < pos {
+                    Brightness::Dim
+                } else {
+                    Brightness::Off
+                }
+            }
+            None => Brightness::Off,
+        };
+        lights.set_slider(i, b);
+    }
 }
 
 fn main_loop(
@@ -134,6 +186,13 @@ fn main_loop(
     // one row of values per mode (plain modes only use the first slot)
     let mut mode_values: [[u8; MAX_PARAMS]; MODES.len()] = MODES.map(|m| [m.start; MAX_PARAMS]);
     let mut current_param: usize = 0; // which parameter Left/Right have selected
+    let mut recording = false; // whether the Sampling light is currently "on"
+    let mut playing = false; // Play light state
+    let mut rec_on = false; // Rec light state (separate from the Sampling toggle)
+    let mut strip_mode: Option<Buttons> = None; // Pitch, Mod, or None
+    let mut strip_touched = false;
+    let mut mod_value: u8 = 0; // last mod wheel value, so the LEDs can show it
+    let mut last_strip: i32 = i32::MIN; // last value sent, to avoid repeats
     let mut prev_encoder: Option<u8> = None;
     show_text(device, screen, "Ready...")?;   // display "Ready..." on the screen
     loop {
@@ -192,6 +251,118 @@ fn main_loop(
                                 None => show_text(device, screen, "Ready...")?,
                             }
                             changed_lights = true;
+                        }
+                        was_down[idx] = status;
+                        continue;
+                    }
+
+                    // strip mode buttons: PITCH / MOD act like radio buttons
+                    if STRIP_BUTTONS.contains(&button) {
+                        if status && !was_down[idx] {
+                            let prev = strip_mode;
+                            strip_mode = if strip_mode == Some(button) {
+                                None
+                            } else {
+                                Some(button)
+                            };
+                            // leaving Pitch: make sure the bend goes back to center
+                            if prev == Some(Buttons::Pitch) {
+                                send_pitch(port, 0);
+                            }
+                            // leaving Perform: release the effect
+                            if prev == Some(Buttons::Perform) {
+                                send_cc(port, PERFORM_CC, 0);
+                            }
+                            strip_touched = false;
+                            last_strip = i32::MIN;
+                            for b in STRIP_BUTTONS {
+                                lights.set_button(
+                                    b,
+                                    if strip_mode == Some(b) {
+                                        Brightness::Normal
+                                    } else {
+                                        Brightness::Off
+                                    },
+                                );
+                            }
+                            match strip_mode {
+                                Some(Buttons::Pitch) => draw_strip(lights, strip_mode, 12),
+                                Some(Buttons::Mod) => {
+                                    draw_strip(lights, strip_mode, mod_value as usize * 24 / 127)
+                                }
+                                // Perform (or nothing): start with the LEDs dark
+                                _ => {
+                                    for i in 0..25 {
+                                        lights.set_slider(i, Brightness::Off);
+                                    }
+                                }
+                            }
+                            changed_lights = true;
+                        }
+                        was_down[idx] = status;
+                        continue;
+                    }
+
+                    // transport buttons: Play and Rec toggle their lights, Stop clears
+                    // both. Every press sends 127 and every release sends 0.
+                    if button == Buttons::Play || button == Buttons::Stop || button == Buttons::Rec {
+                        if status != was_down[idx] {
+                            let cc = match button {
+                                Buttons::Play => PLAY_CC,
+                                Buttons::Stop => STOP_CC,
+                                _ => REC_CC,
+                            };
+                            send_cc(port, cc, if status { 127 } else { 0 });
+                            if status {
+                                match button {
+                                    Buttons::Play => playing = !playing,
+                                    Buttons::Rec => rec_on = !rec_on,
+                                    _ => {
+                                        playing = false;
+                                        rec_on = false;
+                                    }
+                                }
+                            }
+                            lights.set_button(
+                                Buttons::Play,
+                                if playing { Brightness::Normal } else { Brightness::Off },
+                            );
+                            lights.set_button(
+                                Buttons::Rec,
+                                if rec_on { Brightness::Normal } else { Brightness::Off },
+                            );
+                            // Stop only lights while it is held down
+                            lights.set_button(
+                                Buttons::Stop,
+                                if button == Buttons::Stop && status {
+                                    Brightness::Normal
+                                } else {
+                                    Brightness::Off
+                                },
+                            );
+                            changed_lights = true;
+                        }
+                        was_down[idx] = status;
+                        continue;
+                    }
+
+                    // Sampling button: record toggle. Sends CC 24 on press (127) and
+                    // release (0); the light flips on each press
+                    if button == Buttons::Sampling {
+                        if status != was_down[idx] {
+                            send_cc(port, RECORD_CC, if status { 127 } else { 0 });
+                            if status {
+                                recording = !recording;
+                                lights.set_button(
+                                    Buttons::Sampling,
+                                    if recording {
+                                        Brightness::Normal
+                                    } else {
+                                        Brightness::Off
+                                    },
+                                );
+                                changed_lights = true;
+                            }
                         }
                         was_down[idx] = status;
                         continue;
@@ -279,18 +450,69 @@ fn main_loop(
             }
             prev_encoder = Some(encoder_val);
             let slider_val = buf[10];
-            if slider_val != 0 {
-                println!("Slider: {}", slider_val);
-                let cnt = (slider_val as i32 - 1 + 5) * 25 / 200 - 1;
-                for i in 0..25 {
-                    let b = match cnt - i {
-                        0 => Brightness::Normal,
-                        1..=25 => Brightness::Dim,
-                        _ => Brightness::Off,
-                    };
-                    lights.set_slider(i as usize, b);
+            match strip_mode {
+                Some(mode) => {
+                    if slider_val != 0 {
+                        strip_touched = true;
+                        let frac = (slider_val as i32 - 1).clamp(0, 199); // 0 to 199
+                        let pos = (frac * 24 / 199) as usize;
+                        if mode == Buttons::Pitch {
+                            let bend = (frac * 16383 / 199 - 8192).clamp(-8192, 8191);
+                            if bend != last_strip {
+                                last_strip = bend;
+                                send_pitch(port, bend as i16);
+                            }
+                        } else {
+                            // Mod and Perform both send a 0-127 CC
+                            let value = (frac * 127 / 199) as u8;
+                            if value as i32 != last_strip {
+                                last_strip = value as i32;
+                                if mode == Buttons::Mod {
+                                    mod_value = value;
+                                    send_cc(port, MOD_CC, value);
+                                } else {
+                                    send_cc(port, PERFORM_CC, value);
+                                }
+                            }
+                        }
+                        draw_strip(lights, strip_mode, pos);
+                        changed_lights = true;
+                    } else if strip_touched {
+                        // finger lifted
+                        strip_touched = false;
+                        last_strip = i32::MIN;
+                        if mode == Buttons::Pitch {
+                            // Pitch springs back to center
+                            send_pitch(port, 0);
+                            draw_strip(lights, strip_mode, 12);
+                            changed_lights = true;
+                        } else if mode == Buttons::Perform {
+                            // Perform releases the effect and clears the LEDs
+                            send_cc(port, PERFORM_CC, 0);
+                            for i in 0..25 {
+                                lights.set_slider(i, Brightness::Off);
+                            }
+                            changed_lights = true;
+                        }
+                        // Mod stays where you left it
+                    }
                 }
-                changed_lights = true;
+                None => {
+                    // no strip mode: the original LED-only behavior
+                    if slider_val != 0 {
+                        println!("Slider: {}", slider_val);
+                        let cnt = (slider_val as i32 - 1 + 5) * 25 / 200 - 1;
+                        for i in 0..25 {
+                            let b = match cnt - i {
+                                0 => Brightness::Normal,
+                                1..=25 => Brightness::Dim,
+                                _ => Brightness::Off,
+                            };
+                            lights.set_slider(i as usize, b);
+                        }
+                        changed_lights = true;
+                    }
+                }
             }
         } else if buf[0] == 0x02 {
             // pad mode
