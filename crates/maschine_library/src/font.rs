@@ -693,7 +693,7 @@ const LOWERCASE: [[&[u8; 8]; 8]; 26] = [
 
 const SPACE: [&[u8; 8]; 8] = [b"        "; 8];
 
-const PUNCTUATION: [[&[u8; 8]; 8]; 15] = [
+const PUNCTUATION: [[&[u8; 8]; 8]; 18] = [
     // (
     [
         b"    x   ",
@@ -859,6 +859,39 @@ const PUNCTUATION: [[&[u8; 8]; 8]; 15] = [
         b"   xx   ",
         b"        ",
     ],
+    // #
+    [
+        b"        ",
+        b"  x  x  ",
+        b" xxxxxx ",
+        b"  x  x  ",
+        b" xxxxxx ",
+        b"  x  x  ",
+        b"        ",
+        b"        ",
+    ],
+    // ♯
+    [
+        b"   x  x ",
+        b"  x  x  ",
+        b"  xxxxx ",
+        b"   xxxxx",
+        b"  x  x  ",
+        b" x  x   ",
+        b" x  x   ",
+        b"        ",
+    ],
+    // ♭
+    [
+        b"  xx    ",
+        b"  x     ",
+        b"  x     ",
+        b"  x xx  ",
+        b"  xx  x ",
+        b"  x   x ",
+        b"   xxx  ",
+        b"        ",
+    ],
 ];
 
 pub struct Font {}
@@ -889,6 +922,9 @@ impl Font {
             '=' => &PUNCTUATION[12],
             '-' => &PUNCTUATION[13],
             ':' => &PUNCTUATION[14],
+            '#' => &PUNCTUATION[15],
+            '♯' => &PUNCTUATION[16],
+            '♭' => &PUNCTUATION[17],
             _ => return false,
         };
 
@@ -915,7 +951,8 @@ mod tests {
     fn writes_all_supported_characters() {
         let mut screen = Screen::new();
         for character in
-            "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz (),.!?/><|&*=-:".chars()
+            "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz (),.!?/><|&*=-:#♯♭"
+                .chars()
         {
             assert!(Font::write_char(&mut screen, 0, 0, character, 1));
         }

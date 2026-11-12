@@ -109,6 +109,8 @@ const RECORD_CC: u8 = 24; // Sampling button: record toggle
 const PLAY_CC: u8 = 25;
 const STOP_CC: u8 = 26;
 const REC_CC: u8 = 27;
+const LOCK_CC: u8 = 28; // toggle: snapshot store/recall
+const AUTO_CC: u8 = 30; // held: 127 while down, 0 on release
 
 fn send_cc(port: &mut MidiOutputConnection, controller: u8, value: u8) {
     let ev = LiveEvent::Midi {
@@ -170,6 +172,41 @@ fn draw_strip(lights: &mut Lights, mode: Option<Buttons>, pos: usize) {
     }
 }
 
+// pad input modes: the button and the name shown on the screen.
+// One is always active, like NI's. CHORDS and STEP are not added yet.
+const PAD_MODES: [(Buttons, &str); 2] = [
+    (Buttons::PadMode, "Pad Mode"),
+    (Buttons::Keyboard, "Keyboard"),
+];
+const PAD_MODE_KEYBOARD: usize = 1; // index of Keyboard in PAD_MODES
+
+const DEFAULT_KEY: u8 = 60; // C3 (MIDI note 60), the default base key
+const MIN_KEY: u8 = 24; // C0
+const MAX_KEY: u8 = 108; // C7, so Keyboard's 16 pads stay within MIDI range
+
+// MIDI note number to a name like "C♯3" (60 = C3)
+fn key_name(note: u8) -> String {
+    const NAMES: [&str; 12] = ["C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B"];
+    format!("{}{}", NAMES[(note % 12) as usize], note as i32 / 12 - 2)
+}
+
+// the screen's home text, e.g. "Pad Mode: C3"
+fn pad_text(mode: usize, base_key: u8) -> String {
+    format!("{}: {}", PAD_MODES[mode].1, key_name(base_key))
+}
+
+// which MIDI note a pad plays in the current pad mode
+fn pad_note(settings: &Settings, mode: usize, base_key: u8, pad: usize) -> u8 {
+    if mode == PAD_MODE_KEYBOARD {
+        // pad 1 plays the base key, then one semitone up per pad
+        base_key + pad as u8
+    } else {
+        // shift every note in notemaps by how far the base key is from C3
+        let shift = base_key as i32 - DEFAULT_KEY as i32;
+        (settings.notemaps[pad] as i32 + shift).clamp(0, 127) as u8
+    }
+}
+
 fn main_loop(
 
     device: &HidDevice,
@@ -189,12 +226,22 @@ fn main_loop(
     let mut recording = false; // whether the Sampling light is currently "on"
     let mut playing = false; // Play light state
     let mut rec_on = false; // Rec light state (separate from the Sampling toggle)
+    let mut lock_on = false; // Lock light state
+    let mut pad_mode: usize = 0; // index into PAD_MODES; 0 = Pad Mode is the default
+    let mut base_key: u8 = DEFAULT_KEY;
+    let mut shift_held = false; // whether SHIFT is currently down
+    // the note each pad is currently sounding, so Note Off matches Note On
+    // even if the mode or key changes while a pad is held
+    let mut sounding: [Option<u8>; 16] = [None; 16];
     let mut strip_mode: Option<Buttons> = None; // Pitch, Mod, or None
     let mut strip_touched = false;
     let mut mod_value: u8 = 0; // last mod wheel value, so the LEDs can show it
     let mut last_strip: i32 = i32::MIN; // last value sent, to avoid repeats
     let mut prev_encoder: Option<u8> = None;
-    show_text(device, screen, "Ready...")?;   // display "Ready..." on the screen
+    // Pad Mode starts lit, with its key on the screen
+    lights.set_button(PAD_MODES[pad_mode].0, Brightness::Normal);
+    lights.write(device)?;
+    show_text(device, screen, &pad_text(pad_mode, base_key))?;
     loop {
         let size = device.read_timeout(&mut buf, 10)?;
         if size < 1 {
@@ -216,6 +263,9 @@ fn main_loop(
                     };
                     let status = buf[i + 1] & (1 << j);
                     let status = status > 0;
+                    if button == Buttons::Shift {
+                        shift_held = status;
+                    }
                     if status {
                         println!("{:?}", button);
                     }
@@ -248,9 +298,62 @@ fn main_loop(
                                         &mode_text(&MODES[i], p, mode_values[i][p]),
                                     )?
                                 }
-                                None => show_text(device, screen, "Ready...")?,
+                                None => show_text(device, screen, &pad_text(pad_mode, base_key))?,
                             }
                             changed_lights = true;
+                        }
+                        was_down[idx] = status;
+                        continue;
+                    }
+
+                    // pad mode buttons: radio group, one is always active. Pressing
+                    // the active one does nothing.
+                    if let Some(p_idx) = PAD_MODES.iter().position(|m| m.0 == button) {
+                        if status && !was_down[idx] {
+                            pad_mode = p_idx;
+                            for (i, m) in PAD_MODES.iter().enumerate() {
+                                lights.set_button(
+                                    m.0,
+                                    if i == pad_mode { Brightness::Normal } else { Brightness::Off },
+                                );
+                            }
+                            // show the new mode, unless an encoder mode owns the screen
+                            if active_mode.is_none() {
+                                show_text(device, screen, &pad_text(pad_mode, base_key))?;
+                            }
+                            changed_lights = true;
+                        }
+                        was_down[idx] = status;
+                        continue;
+                    }
+
+                    // AUTO: hold button. 127 while held, 0 on release; the light follows
+                    if button == Buttons::Auto {
+                        if status != was_down[idx] {
+                            send_cc(port, AUTO_CC, if status { 127 } else { 0 });
+                            lights.set_button(
+                                Buttons::Auto,
+                                if status { Brightness::Normal } else { Brightness::Off },
+                            );
+                            changed_lights = true;
+                        }
+                        was_down[idx] = status;
+                        continue;
+                    }
+
+                    // LOCK: toggle. Every press sends 127 and every release sends 0;
+                    // the light flips on each press
+                    if button == Buttons::Lock {
+                        if status != was_down[idx] {
+                            send_cc(port, LOCK_CC, if status { 127 } else { 0 });
+                            if status {
+                                lock_on = !lock_on;
+                                lights.set_button(
+                                    Buttons::Lock,
+                                    if lock_on { Brightness::Normal } else { Brightness::Off },
+                                );
+                                changed_lights = true;
+                            }
                         }
                         was_down[idx] = status;
                         continue;
@@ -445,6 +548,15 @@ fn main_loop(
                         println!("{}", text);
                         show_text(device, screen, &text)?;
                         send_cc(port, MODES[i].cc + p as u8, value);
+                    } else {
+                        // no encoder mode lit: the encoder changes the base key
+                        // SHIFT held: jump by octaves (12 semitones) instead of 1
+                        let step = if shift_held { 12 } else { 1 };
+                        base_key = (base_key as i32 + delta * step)
+                            .clamp(MIN_KEY as i32, MAX_KEY as i32) as u8;
+                        let text = pad_text(pad_mode, base_key);
+                        println!("{}", text);
+                        show_text(device, screen, &text)?;
                     }
                 }
             }
@@ -546,7 +658,16 @@ fn main_loop(
                     changed_lights = true;
                 }
 
-                let note = settings.notemaps[idx as usize];
+                // Note Off reuses the note that was sent for Note On
+                let note = match pad_evt {
+                    PadEventType::NoteOff | PadEventType::PressOff => sounding[idx as usize]
+                        .take()
+                        .unwrap_or_else(|| pad_note(settings, pad_mode, base_key, idx as usize)),
+                    _ => pad_note(settings, pad_mode, base_key, idx as usize),
+                };
+                if matches!(pad_evt, PadEventType::NoteOn | PadEventType::PressOn) {
+                    sounding[idx as usize] = Some(note);
+                }
                 let mut velocity = (val >> 5) as u8;
                 if val > 0 && velocity == 0 {
                     velocity = 1;
